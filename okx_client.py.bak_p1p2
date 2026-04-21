@@ -140,17 +140,14 @@ class OKXClient:
             return result["data"][0]
         return {}
 
-    def get_positions(self, inst_id: str = None, inst_type: str = None) -> list:
-        """查询持仓. inst_type=MARGIN/SWAP/FUTURES/OPTION"""
+    def get_positions(self, inst_id: str = None) -> list:
+        """查询持仓"""
         params = {}
         if inst_id:
             params["instId"] = inst_id
-        if inst_type:
-            params["instType"] = inst_type
         result = self.get("/api/v5/account/positions", params)
-        if result.get("code") == "0":
-            # 过滤掉 pos=0 的空记录
-            return [p for p in result.get("data", []) if float(p.get("pos", "0") or 0) != 0]
+        if result["code"] == "0":
+            return result["data"]
         return []
 
     def set_leverage(self, inst_id: str, lever: int, mgn_mode: str = "cross"):
@@ -182,6 +179,7 @@ class OKXClient:
         ord_type: str = "market",
         px: str = None,
         tgt_ccy: str = None,
+        ccy: str = None,
         sl_trigger_px: str = None,
         sl_ord_px: str = None,
         tp_trigger_px: str = None,
@@ -202,23 +200,10 @@ class OKXClient:
         }
         if px:
             data["px"] = px
-        if tgt_ccy and td_mode == "cash":
-            # 现货模式支持 tgtCcy, 指定 sz 为 BTC 数量
+        if tgt_ccy:
             data["tgtCcy"] = tgt_ccy
-        elif td_mode in ("cross", "isolated"):
-            # 杠杆模式需要 ccy 参数
-            data["ccy"] = "USDT"
-            if ord_type == "market" and side == "buy":
-                # 市价买入时 sz 默认为 USDT, 需要换算 BTC -> USDT
-                try:
-                    ticker = self.get_ticker(inst_id)
-                    price = float(ticker.get("last", 0))
-                    if price > 0:
-                        sz_usdt = round(float(sz) * price, 2)
-                        data["sz"] = str(sz_usdt)
-                        logger.info(f"杠杆买入: {sz} BTC -> {sz_usdt} USDT")
-                except Exception as e:
-                    logger.error(f"价格换算失败: {e}")
+        if ccy:
+            data["ccy"] = ccy
         if sl_trigger_px:
             data["slTriggerPx"] = sl_trigger_px
             data["slOrdPx"] = sl_ord_px or "-1"  # -1 = 市价止损
@@ -260,6 +245,27 @@ class OKXClient:
         if result["code"] == "0":
             return result["data"]
         return []
+
+    def close_position(
+        self,
+        inst_id: str,
+        mgn_mode: str = "cross",
+        ccy: str = None,
+    ) -> dict:
+        """
+        市价平仓 (杠杆/合约专用)
+        mgn_mode: cross / isolated
+        ccy: 交易币种 (cross 模式必填)
+        """
+        data = {"instId": inst_id, "mgnMode": mgn_mode}
+        if ccy:
+            data["ccy"] = ccy
+        result = self.post("/api/v5/trade/close-position", data)
+        if result.get("code") == "0":
+            logger.info(f"平仓成功: {inst_id} mgnMode={mgn_mode}")
+        else:
+            logger.error(f"平仓失败: {result.get("msg")}")
+        return result
 
     # ── 策略委托（止盈止损单） ──────────────────
     def place_algo_order(
