@@ -138,6 +138,7 @@ class StrategyConfig:
     # EMA 参数
     ema_fast: int = 9
     ema_slow: int = 21
+    ema_trend: int = 50
 
     # RSI 参数
     rsi_period: int = 14
@@ -159,7 +160,11 @@ class StrategyConfig:
     vol_weight: float = 0.15
 
     # 信号阈值 (综合得分达到此值才开仓)
-    signal_threshold: float = 0.4
+    signal_threshold: float = 0.3
+
+    # 3x 杠杆做空专用过滤
+    margin_3x_short_threshold: float = 0.5
+    margin_3x_trend_filter: bool = True
 
     # K线回溯数量
     lookback_candles: int = 100

@@ -89,6 +89,7 @@ def compute_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # EMA
     df["ema_fast"] = calc_ema(close, strategy_cfg.ema_fast)
     df["ema_slow"] = calc_ema(close, strategy_cfg.ema_slow)
+    df["ema_trend"] = calc_ema(close, strategy_cfg.ema_trend)
 
     # RSI
     df["rsi"] = calc_rsi(close, strategy_cfg.rsi_period)

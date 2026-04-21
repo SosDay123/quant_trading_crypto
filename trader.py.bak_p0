@@ -6,7 +6,7 @@ import time
 import logging
 from typing import Optional
 
-from config import pair_cfg, risk_cfg, capital_cfg
+from config import pair_cfg, risk_cfg
 from okx_client import OKXClient
 from strategy import MultiSignalStrategy, Signal, TradeSignal
 from risk_manager import RiskManager, Position
@@ -51,38 +51,14 @@ class Trader:
             result = self.client.set_leverage(self.inst_id, lever, "cross")
             logger.info(f"设置 {mode} 杠杆 {lever}x: {result.get('msg', 'ok')}")
 
-        # 查询余额并同步为真实总资金 (修复 INITIAL_CAPITAL 与实盘不符的问题)
+        # 查询余额
         balance = self.client.get_balance("USDT")
-        real_capital = 0.0
         if balance:
             details = balance.get("details", [])
             for d in details:
                 if d.get("ccy") == "USDT":
                     avail = d.get("availBal", "0")
-                    try:
-                        real_capital = float(avail)
-                    except (TypeError, ValueError):
-                        real_capital = 0.0
                     logger.info(f"USDT 可用余额: {avail}")
-
-        if real_capital > 0:
-            old_cap = capital_cfg.total_capital
-            capital_cfg.total_capital = real_capital
-            # 同步风控状态基准 (峰值/当前净值/日初净值 都锚定到真实资金)
-            self.risk.state.peak_equity = real_capital
-            self.risk.state.current_equity = real_capital
-            self.risk.state.day_start_equity = real_capital
-            logger.info(
-                f"资金基准已同步: ${old_cap:.2f} -> ${real_capital:.2f} "
-                f"(spot ${capital_cfg.spot_capital:.2f} | "
-                f"2x ${capital_cfg.margin_2x_capital:.2f} | "
-                f"3x ${capital_cfg.margin_3x_capital:.2f})"
-            )
-        else:
-            logger.warning("未能读取真实余额, 仍使用 INITIAL_CAPITAL 配置值")
-
-        # 同步交易所已有仓位 (避免重启后叠加开仓)
-        self._reconcile_exchange_positions(on_startup=True)
 
         logger.info("=== 初始化完成 ===")
 
@@ -92,9 +68,6 @@ class Trader:
         单次交易循环:
         1. 获取K线 → 2. 生成信号 → 3. 风险检查 → 4. 执行交易 → 5. 管理仓位
         """
-        # 0. 先与交易所对账 (SL/TP algo 可能在轮询间隙已触发)
-        self._reconcile_exchange_positions()
-
         # 1. 获取K线数据
         candles = self.client.get_candles(limit=100)
         if not candles:
@@ -118,87 +91,6 @@ class Trader:
             f"回撤={status['drawdown_pct']}% | 持仓={status['open_positions']}"
         )
 
-    # ── 仓位对账 (与交易所同步) ───────────────
-    def _reconcile_exchange_positions(self, on_startup: bool = False):
-        """
-        与交易所仓位对账:
-        - 启动时: 若交易所已有 margin 仓位而本地无, 注册到本地状态
-        - 运行时: 若本地有但交易所已无 (SL/TP algo 已触发), 按 ticker 价标记平仓
-        现货 BTC 余额不在此处理 (OKX 无 position 概念, 交由 _check_open_positions 本地止损)。
-        """
-        try:
-            ex_positions = self.client.get_positions(
-                inst_id=self.inst_id, inst_type="MARGIN"
-            )
-        except Exception as e:
-            logger.warning(f"查询交易所仓位失败: {e}")
-            return
-
-        # 交易所 margin 仓位: {trade_mode: (side, size, avgPx)}
-        ex_margin = {}
-        for p in ex_positions:
-            pos_amt = float(p.get("pos", "0") or 0)
-            if pos_amt == 0:
-                continue
-            lever = int(float(p.get("lever", "1") or 1))
-            mode = f"margin_{lever}x"
-            if mode not in ("margin_2x", "margin_3x"):
-                continue
-            side = "buy" if pos_amt > 0 else "sell"
-            size = abs(pos_amt)
-            avg_px = float(p.get("avgPx", "0") or 0)
-            ex_margin[mode] = (side, size, avg_px)
-
-        # 1) 启动时: 注册交易所已有仓位到本地
-        if on_startup:
-            for mode, (side, size, avg_px) in ex_margin.items():
-                has_local = any(
-                    pos.trade_mode == mode for pos in self.risk.state.open_positions
-                )
-                if not has_local and avg_px > 0:
-                    sl = self.risk.calc_stop_loss(mode, avg_px, side, atr=0.0)
-                    tp = self.risk.calc_take_profit(mode, avg_px, side)
-                    pos = Position(
-                        trade_mode=mode, side=side, entry_price=avg_px,
-                        size=size, stop_loss=sl, take_profit=tp,
-                        order_id="RECOVERED", entry_time=time.time(),
-                    )
-                    self.risk.register_position(pos)
-                    logger.warning(
-                        f"[RECOVER] 发现交易所已有 {mode} 仓位: {side} {size} BTC @ {avg_px}, 已注册到本地"
-                    )
-            return
-
-        # 2) 运行时: 本地有但交易所无 → 已被 algo 平仓
-        ticker = self.client.get_ticker()
-        last_price = float(ticker.get("last", 0)) if ticker else 0.0
-
-        for pos in list(self.risk.state.open_positions):
-            if pos.trade_mode == "spot":
-                continue  # 现货不通过 positions API
-            if pos.trade_mode not in ex_margin:
-                # 交易所已无此仓位 → 按最可能的触发价标记平仓
-                if last_price > 0:
-                    # 根据方向和当前价推断触发的是 SL 还是 TP
-                    if pos.side == "buy":
-                        if last_price <= pos.stop_loss * 1.005:
-                            exit_px = pos.stop_loss
-                        elif last_price >= pos.take_profit * 0.995:
-                            exit_px = pos.take_profit
-                        else:
-                            exit_px = last_price
-                    else:
-                        if last_price >= pos.stop_loss * 0.995:
-                            exit_px = pos.stop_loss
-                        elif last_price <= pos.take_profit * 1.005:
-                            exit_px = pos.take_profit
-                        else:
-                            exit_px = last_price
-                    logger.info(
-                        f"[SYNC] 交易所 {pos.trade_mode} 仓位已消失 (algo 触发), 按 {exit_px} 标记平仓"
-                    )
-                    self.risk.close_position(pos, exit_px)
-
     # ── 开仓 ──────────────────────────────────
     def _try_open_positions(self, signal: TradeSignal):
         """对三种交易模式分别尝试开仓"""
@@ -206,9 +98,8 @@ class Trader:
 
         modes = ["spot", "margin_2x", "margin_3x"]
 
-        # 长周期趋势判断 (顺势交易过滤)
+        # 长周期趋势判断 (3x 做空过滤用)
         trend_is_down = False
-        trend_is_up = False
         try:
             candles = self.client.get_candles(limit=100)
             from indicators import parse_candles_to_df, compute_all_indicators
@@ -216,35 +107,22 @@ class Trader:
             if len(df_t) > 0:
                 ema_t = df_t.iloc[-1].get("ema_trend")
                 close_t = df_t.iloc[-1].get("close")
-                if ema_t and close_t:
-                    if close_t < ema_t:
-                        trend_is_down = True
-                    elif close_t > ema_t:
-                        trend_is_up = True
+                if ema_t and close_t and close_t < ema_t:
+                    trend_is_down = True
         except Exception as e:
             logger.warning(f"趋势判断失败: {e}")
-
-        # 趋势过滤: 下跌趋势禁止做多, 上涨趋势禁止做空
-        if signal.signal == Signal.LONG and trend_is_down:
-            logger.info(f"趋势过滤: 价格在EMA50下方, 禁止做多")
-            return
-        if signal.signal == Signal.SHORT and trend_is_up:
-            logger.info(f"趋势过滤: 价格在EMA50上方, 禁止做空")
-            return
-
-        # 做空信号质量过滤: 只做高确定性做空 (强度>=0.5)
-        if signal.signal == Signal.SHORT and signal.strength < 0.5:
-            logger.info(f"做空过滤: 信号强度 {signal.strength:.3f} < 0.5, 跳过")
-            return
 
         for mode in modes:
             if mode == "spot" and signal.signal == Signal.SHORT:
                 continue
 
-            # 3x 做空专用过滤: 更高阈值
+            # 3x 做空专用过滤
             if mode == "margin_3x" and signal.signal == Signal.SHORT:
                 if signal.strength < strategy_cfg.margin_3x_short_threshold:
                     logger.info(f"[3x] 做空信号强度 {signal.strength:.3f} 不足, 跳过")
+                    continue
+                if strategy_cfg.margin_3x_trend_filter and not trend_is_down:
+                    logger.info(f"[3x] 长周期趋势向上, 禁止做空")
                     continue
 
             allowed, reason = self.risk.can_trade(mode)
@@ -268,15 +146,26 @@ class Trader:
                 f"| SL={sl} TP={tp} | 信号强度={signal.strength:.3f}"
             )
 
-            # 下市价单
-            result = self.client.place_order(
-                inst_id=self.inst_id,
-                td_mode=td_mode,
-                side=side,
-                sz=str(size),
-                ord_type="market",
-                tgt_ccy="base_ccy",
-            )
+            # 下市价单 — 现货 vs 杠杆格式不同
+            if td_mode == "cash":
+                # 现货: sz 单位 = BTC, 需 tgt_ccy=base_ccy
+                result = self.client.place_order(
+                    inst_id=self.inst_id, td_mode=td_mode, side=side,
+                    sz=str(size), ord_type="market", tgt_ccy="base_ccy",
+                )
+            else:
+                # 杠杆: 做多借 USDT (sz 单位 USDT), 做空借 BTC (sz 单位 BTC)
+                if side == "buy":
+                    notional_usdt = round(size * signal.price, 2)
+                    result = self.client.place_order(
+                        inst_id=self.inst_id, td_mode=td_mode, side=side,
+                        sz=str(notional_usdt), ord_type="market", ccy="USDT",
+                    )
+                else:
+                    result = self.client.place_order(
+                        inst_id=self.inst_id, td_mode=td_mode, side=side,
+                        sz=str(size), ord_type="market", ccy="BTC",
+                    )
 
             if result.get("code") == "0" and result.get("data"):
                 ord_id = result["data"][0].get("ordId", "")
@@ -367,13 +256,19 @@ class Trader:
 
         logger.info(f"[{pos.trade_mode}] 平仓: {reason} | 当前价={price}")
 
-        result = self.client.place_order(
-            inst_id=self.inst_id,
-            td_mode=td_mode,
-            side=close_side,
-            sz=str(pos.size),
-            ord_type="market",
-        )
+        if td_mode == "cash":
+            # 现货: 市价单卖/买同等数量 BTC
+            result = self.client.place_order(
+                inst_id=self.inst_id, td_mode=td_mode, side=close_side,
+                sz=str(pos.size), ord_type="market", tgt_ccy="base_ccy",
+            )
+        else:
+            # 杠杆: 用 close-position API (自动计算仓位, 避免 sz 单位问题)
+            # 做多借的 USDT -> 平仓 ccy=USDT; 做空借的 BTC -> 平仓 ccy=BTC
+            close_ccy = "USDT" if pos.side == "buy" else "BTC"
+            result = self.client.close_position(
+                inst_id=self.inst_id, mgn_mode=td_mode, ccy=close_ccy,
+            )
 
         if result.get("code") == "0":
             self.risk.close_position(pos, price)

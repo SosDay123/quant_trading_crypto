@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import requests
 import numpy as np
 import pandas as pd
 
@@ -122,6 +123,8 @@ class BacktestEngine:
         open_positions: dict[str, BacktestTrade] = {}  # mode -> trade
         consecutive_losses = 0
         cooldown_until_bar = -1
+        day_start_equity = equity  # 每日起始净值，用于日亏损限额
+        current_day = None         # 当前交易日
 
         window = strategy_cfg.lookback_candles
 
@@ -230,8 +233,17 @@ class BacktestEngine:
             if i < cooldown_until_bar:
                 continue
 
-            daily_loss_limit = self.initial_capital * risk_cfg.max_daily_loss_pct
-            if equity < self.initial_capital - daily_loss_limit:
+            # 日亏损限额：按天重置
+            bar_ts = row.get("ts", None)
+            if bar_ts is not None and hasattr(bar_ts, 'date'):
+                bar_day = bar_ts.date()
+            else:
+                bar_day = i // 96  # 15分钟K线，96根=1天
+            if bar_day != current_day:
+                current_day = bar_day
+                day_start_equity = equity  # 新的一天，重置起始净值
+            daily_loss_limit = day_start_equity * risk_cfg.max_daily_loss_pct
+            if equity < day_start_equity - daily_loss_limit:
                 continue
 
             max_dd_limit = peak_equity * (1 - risk_cfg.max_drawdown_pct)
@@ -242,9 +254,22 @@ class BacktestEngine:
                 continue
 
             # ── 4. 生成信号 ──
-            # 用当前行的指标直接评分 (避免重复计算)
-            signal = self._quick_signal(row, prev, price, atr)
+            signal, score = self._quick_signal(row, prev, price, atr)
             if signal == Signal.HOLD:
+                continue
+            ema_trend_val = row.get("ema_trend", None)
+            has_trend = (ema_trend_val is not None) and (not pd.isna(ema_trend_val))
+            trend_is_down = has_trend and (price < ema_trend_val)
+            trend_is_up = has_trend and (price > ema_trend_val)
+
+            # ── 趋势过滤: 顺势交易 ──
+            if signal == Signal.LONG and trend_is_down:
+                continue  # 下跌趋势禁止做多
+            if signal == Signal.SHORT and trend_is_up:
+                continue  # 上涨趋势禁止做空
+
+            # ── 做空信号质量过滤: 只做高确定性做空 ──
+            if signal == Signal.SHORT and abs(score) < 0.5:
                 continue
 
             # ── 5. 尝试开仓 ──
@@ -253,6 +278,10 @@ class BacktestEngine:
                     continue
                 if signal == Signal.SHORT and not params["can_short"]:
                     continue
+                # 3x 做空专用过滤: 更高阈值
+                if mode == "margin_3x" and signal == Signal.SHORT:
+                    if abs(score) < strategy_cfg.margin_3x_short_threshold:
+                        continue
 
                 side = "buy" if signal == Signal.LONG else "sell"
                 cap = self.initial_capital * params["capital_ratio"]
@@ -389,10 +418,10 @@ class BacktestEngine:
         final = normalized * (1 + vol_score * cfg.vol_weight)
 
         if final >= cfg.signal_threshold:
-            return Signal.LONG
+            return Signal.LONG, final
         elif final <= -cfg.signal_threshold:
-            return Signal.SHORT
-        return Signal.HOLD
+            return Signal.SHORT, final
+        return Signal.HOLD, final
 
     def _calc_metrics(self, final_equity: float) -> dict:
         """计算绩效指标"""
@@ -565,6 +594,91 @@ def generate_synthetic_btc(
     return pd.DataFrame(rows)
 
 
+
+# ══════════════════════════════════════════════
+# OKX 真实历史数据获取
+# ══════════════════════════════════════════════
+def fetch_okx_candles(
+    inst_id: str = "BTC-USDT",
+    bar: str = "15m",
+    total_bars: int = 2000,
+) -> pd.DataFrame:
+    """
+    从 OKX 公开 API 拉取真实历史 K 线数据
+    无需 API Key，使用公开行情接口
+    通过分页获取大量历史数据
+    """
+    BASE = "https://www.okx.com"
+    all_candles = []
+    after = ""
+    per_page = 100  # OKX 每次最多返回 100 条
+
+    print(f"正在从 OKX 拉取 {inst_id} {bar} 真实历史K线...")
+
+    while len(all_candles) < total_bars:
+        params = {"instId": inst_id, "bar": bar, "limit": str(per_page)}
+        if after:
+            params["after"] = after
+
+        # 使用 history-candles 接口获取更久远的数据
+        url = f"{BASE}/api/v5/market/history-candles"
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+        except Exception as e:
+            print(f"  请求失败: {e}, 尝试使用 candles 接口...")
+            url = f"{BASE}/api/v5/market/candles"
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+
+        if data.get("code") != "0" or not data.get("data"):
+            print(f"  API 返回: code={data.get('code')} msg={data.get('msg')}")
+            if not all_candles:
+                raise RuntimeError(f"无法获取K线数据: {data.get('msg')}")
+            break
+
+        batch = data["data"]
+        if not batch:
+            break
+
+        all_candles.extend(batch)
+        after = batch[-1][0]  # 最后一条的时间戳，用于下一页
+
+        remaining = total_bars - len(all_candles)
+        print(f"  已获取 {len(all_candles)} 根K线... (目标 {total_bars})")
+
+        if len(batch) < per_page:
+            print(f"  已到达历史数据尽头")
+            break
+
+        time.sleep(0.2)  # 避免频率限制
+
+    if not all_candles:
+        raise RuntimeError("未获取到任何K线数据")
+
+    # OKX 返回格式: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+    # 按时间正序排列
+    all_candles.reverse()
+
+    rows = []
+    for c in all_candles:
+        rows.append({
+            "ts": pd.to_datetime(int(c[0]), unit="ms", utc=True),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "vol": float(c[5]),
+        })
+
+    df = pd.DataFrame(rows)
+    # 去重并排序
+    df = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+    print(f"  完成! 共 {len(df)} 根K线")
+    return df
+
+
 # ══════════════════════════════════════════════
 # 报告输出
 # ══════════════════════════════════════════════
@@ -622,12 +736,17 @@ def print_report(metrics: dict, trades: list[BacktestTrade]):
 def main():
     parser = argparse.ArgumentParser(description="BTC/USDT 策略回测")
     parser.add_argument("--data", type=str, default=None, help="CSV 数据文件路径")
-    parser.add_argument("--bars", type=int, default=2000, help="模拟数据K线数量")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--okx", action="store_true", help="从 OKX 拉取真实历史K线")
+    parser.add_argument("--pair", type=str, default="BTC-USDT", help="交易对 (默认 BTC-USDT)")
+    parser.add_argument("--interval", type=str, default="15m", help="K线周期 (默认 15m)")
+    parser.add_argument("--bars", type=int, default=2000, help="K线数量")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子 (模拟数据用)")
     parser.add_argument("--capital", type=float, default=100, help="初始资金")
     args = parser.parse_args()
 
-    if args.data:
+    if args.okx:
+        df = fetch_okx_candles(inst_id=args.pair, bar=args.interval, total_bars=args.bars)
+    elif args.data:
         print(f"加载数据: {args.data}")
         df = pd.read_csv(args.data)
         if "ts" not in df.columns:

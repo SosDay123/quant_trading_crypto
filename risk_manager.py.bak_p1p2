@@ -78,10 +78,9 @@ class RiskManager:
         else:
             return 0.0
 
-        # 用实际可用资金更新 (扣除已用保证金, 而非 notional)
-        leverage = {"spot": 1, "margin_2x": 2, "margin_3x": 3}.get(trade_mode, 1)
+        # 用实际可用资金更新 (扣除已用)
         used = sum(
-            (p.size * p.entry_price) / leverage
+            p.size * p.entry_price
             for p in self.state.open_positions
             if p.trade_mode == trade_mode
         )
@@ -101,7 +100,8 @@ class RiskManager:
         # 仓位 = 风险金额 / 止损距离
         size = risk_amount / stop_distance
 
-        # 杠杆放大可用资金 (leverage 已在上方定义)
+        # 杠杆放大可用资金
+        leverage = {"spot": 1, "margin_2x": 2, "margin_3x": 3}.get(trade_mode, 1)
         max_size = (available * leverage) / price
 
         # 不超过最大可用仓位
